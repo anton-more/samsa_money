@@ -1,6 +1,8 @@
 import telebot
 from telebot import types
 import sqlite3
+import logging
+from contextlib import closing
 
 # Ваш токен Telegram API
 TOKEN = "7009129559:AAF4Ai_u6deROWCW7vDjK70U3eJsf7h1fRo"
@@ -8,11 +10,15 @@ TOKEN = "7009129559:AAF4Ai_u6deROWCW7vDjK70U3eJsf7h1fRo"
 # Создаем объект бота
 bot = telebot.TeleBot(TOKEN)
 
+# Настраиваем логирование
+logging.basicConfig(level=logging.INFO)
+
 # Инициализируем переменную expenses
 expenses = {}
 
 # Список пользователей
 users = ['Антон', 'Олег', 'Севиль']
+
 
 # Обработчик команды /start
 @bot.message_handler(commands=['start'])
@@ -65,15 +71,50 @@ def save_expense(call):
     if not expenses.get(chat_id):
         bot.send_message(chat_id, 'спочатку додайте витрату')
         return
+    payer = call.from_user.first_name
     selected_users = ', '.join(expenses[chat_id]['users'])
-    # Подключаемся к базе данных SQLite
-    conn = sqlite3.connect('expenses.db')
-    cursor = conn.cursor()
-    # Записываем данные в базу данных
-    cursor.execute("INSERT INTO expenses VALUES (?, ?, ?)", (chat_id, expenses[chat_id]['amount'], selected_users))
-    conn.commit()
-    conn.close()  # Закрываем соединение
-    bot.send_message(chat_id, f'ок. витрату записано на: {selected_users}')
+    try:
+        with closing(sqlite3.connect('expenses.db')) as conn:
+            with closing(conn.cursor()) as cursor:
+                cursor.execute("INSERT INTO expenses (chat_id, amount, payer, users) VALUES (?, ?, ?, ?)",
+                               (chat_id, expenses[chat_id]['amount'], payer, selected_users))
+                conn.commit()
+        bot.send_message(chat_id, f'ок. витрату записано на: {selected_users}')
+    except sqlite3.Error as e:
+        logging.error(f'Помилка бази даных: {e}')
+        bot.send_message(chat_id, 'Виникла помилка. Спробуйте ще раз.')
+
+# Добавление команды для просмотра всех расходов
+@bot.message_handler(commands=['view_expenses'])
+def view_expenses(message):
+    try:
+        with closing(sqlite3.connect('expenses.db')) as conn:
+            with closing(conn.cursor()) as cursor:
+                cursor.execute("SELECT amount, payer, users FROM expenses WHERE chat_id=?", (message.chat.id,))
+                rows = cursor.fetchall()
+                if rows:
+                    debts = {user: 0 for user in users}
+                    for row in rows:
+                        amount, payer, user_str = row
+                        involved_users = user_str.split(', ')
+                        share = amount / len(involved_users)
+                        for user in involved_users:
+                            if user != payer:
+                                debts[user] -= share
+                                debts[payer] += share
+                    response = "Долги:\n"
+                    for user, amount in debts.items():
+                        if amount > 0:
+                            response += f"{user} повинен отримати {amount} шекелей\n"
+                        elif amount < 0:
+                            response += f"{user} повинен {abs(amount)} шекелей\n"
+                else:
+                    response = "Нема витрат."
+        bot.send_message(message.chat.id, response)
+    except sqlite3.Error as e:
+        logging.error(f'Помилка бази даных: {e}')
+        bot.send_message(message.chat.id, 'Помилка даних. Спробуйте ще раз.')
 
 # Запускаем бота
-bot.polling(none_stop=True)
+if __name__ == '__main__':
+    bot.polling(none_stop=True)
