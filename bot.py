@@ -1,120 +1,287 @@
-import telebot
-from telebot import types
-import sqlite3
 import logging
-from contextlib import closing
+import os
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, ConversationHandler, ContextTypes, filters, CallbackQueryHandler
+)
+from sqlalchemy import create_engine, Column, Integer, String, Float, desc
+from sqlalchemy.orm import sessionmaker, declarative_base
+from dotenv import load_dotenv
+import pandas as pd
 
-# Ваш токен Telegram API
-TOKEN = "7009129559:AAF4Ai_u6deROWCW7vDjK70U3eJsf7h1fRo"
+# Включаем логирование
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
 
-# Создаем объект бота
-bot = telebot.TeleBot(TOKEN)
+# Загрузка переменных окружения из .env файла
+load_dotenv()
 
-# Настраиваем логирование
-logging.basicConfig(level=logging.INFO)
+# Статусы для ConversationHandler
+PAYER, AMOUNT, DESCRIPTION, PARTICIPANTS = range(4)
 
-# Инициализируем переменную expenses
-expenses = {}
+# Инициализация базы данных с использованием SQLAlchemy
+Base = declarative_base()
+DATABASE_URL = 'sqlite:///expenses.db'
+engine = create_engine(DATABASE_URL)
+Session = sessionmaker(bind=engine)
+session = Session()
 
-# Список пользователей
-users = ['Антон', 'Олег', 'Севиль']
+
+class Expense(Base):
+    __tablename__ = 'expenses'
+    id = Column(Integer, primary_key=True)
+    payer = Column(String)
+    amount = Column(Float)
+    description = Column(String)
+    participants = Column(String)
 
 
-# Обработчик команды /start
-@bot.message_handler(commands=['start'])
-def send_welcome(message):
-    markup = types.ReplyKeyboardMarkup(row_width=1)
-    start_button = types.KeyboardButton('додати витрату')
-    markup.add(start_button)
-    bot.send_message(message.chat.id, 'салам!', reply_markup=markup)
+def init_db():
+    Base.metadata.drop_all(engine)
+    Base.metadata.create_all(engine)
 
-# Обработчик нажатия кнопки "додати витрату"
-@bot.message_handler(func=lambda message: message.text == 'додати витрату')
-def ask_expense_amount(message):
-    bot.send_message(message.chat.id, 'введи суму витрати')
-    bot.register_next_step_handler(message, process_expense_amount)
 
-# Обработчик ввода суммы расхода
-def process_expense_amount(message):
+def add_expense(payer, amount, description, participants):
+    session.add(Expense(payer=payer, amount=amount, description=description, participants=participants))
+    session.commit()
+
+
+def delete_last_expense():
+    last_expense = session.query(Expense).order_by(desc(Expense.id)).first()
+    if last_expense:
+        session.delete(last_expense)
+        session.commit()
+        return last_expense
+    return None
+
+
+# Обработчики команд
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logging.info("Команда /start була викликана")
+    await update.message.reply_text(
+        'Салам! Я бот який допомогає з відстеженням витрат. /add додати витрату /help список команд.'
+    )
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logging.info("Команда /help була викликана")
+    await update.message.reply_text(
+        'Команди:\n'
+        '/add - Додати витрату\n'
+        '/debts - Поточні борги\n'
+        '/history - Історія витрат\n'
+        '/undo - Скасувати останню витрату\n'
+        '/report - Отримати звіт\n'
+    )
+
+
+async def add_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    reply_keyboard = [['Антон', 'Олег', 'Севіль', 'Отмена']]
+    await update.message.reply_text(
+        'Хто сплатив?',
+        reply_markup=ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True, resize_keyboard=True)
+    )
+    return PAYER
+
+
+async def add_payer(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data['payer'] = update.message.text
+    reply_keyboard = [['Відмінити']]
+    await update.message.reply_text(
+        'Скільки було витрачено?',
+        reply_markup=ReplyKeyboardMarkup(reply_keyboard, one_time_keyboard=True, resize_keyboard=True)
+    )
+    return AMOUNT
+
+
+async def add_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
-        amount = float(message.text)
-        expenses[message.chat.id] = {'amount': amount, 'users': []}
-        markup = types.InlineKeyboardMarkup()
-        for user in users:
-            markup.add(types.InlineKeyboardButton(user, callback_data=f"user_{user}"))
-        bot.send_message(message.chat.id, 'ок. на кого ця витрата?', reply_markup=markup)
+        amount = float(update.message.text)
+        context.user_data['amount'] = amount
+        await update.message.reply_text('На що ці гроші були витрачені?')
+        return DESCRIPTION
     except ValueError:
-        bot.send_message(message.chat.id, 'будь ласка, введи коректну суму')
+        await update.message.reply_text('Бумласка, введіть число.')
+        return AMOUNT
 
-# Обработчик нажатия кнопок выбора пользователя
-@bot.callback_query_handler(func=lambda call: call.data.startswith('user_'))
-def process_user_selection(call):
-    user = call.data.split('_')[1]
-    chat_id = call.message.chat.id
-    if user in expenses[chat_id]['users']:
-        expenses[chat_id]['users'].remove(user)
+
+async def add_description(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    context.user_data['description'] = update.message.text
+    inline_keyboard = [
+        [InlineKeyboardButton("Антон", callback_data='Антон')],
+        [InlineKeyboardButton("Олег", callback_data='Олег')],
+        [InlineKeyboardButton("Севіль", callback_data='Севіль')],
+        [InlineKeyboardButton("Готово", callback_data='done')],
+    ]
+    await update.message.reply_text(
+        'Хто буде за це платити? Оберіть зі списку і натисніть "Готово".',
+        reply_markup=InlineKeyboardMarkup(inline_keyboard)
+    )
+    context.user_data['participants'] = []
+    context.user_data['done'] = False
+    return PARTICIPANTS
+
+
+async def add_participant(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    if context.user_data['done']:
+        await query.answer("Витрата вже записана.", show_alert=True)
+        return ConversationHandler.END
+    if query.data == 'done':
+        participants = context.user_data['participants']
+        if not participants:
+            await query.edit_message_text('Оберіть учасників.')
+            return PARTICIPANTS
+        payer = context.user_data['payer']
+        amount = context.user_data['amount']
+        description = context.user_data['description']
+        add_expense(payer, amount, description, ','.join(participants))
+        logging.info(
+            f"Витрату додано: {payer} сплачено, {amount} шекелів, {description}, учасники {participants}")
+        context.user_data['done'] = True
+        await query.edit_message_text('Витрату додано.')
+        return ConversationHandler.END
     else:
-        expenses[chat_id]['users'].append(user)
-    markup = types.InlineKeyboardMarkup()
-    for user in users:
-        if user in expenses[chat_id]['users']:
-            markup.add(types.InlineKeyboardButton(user + ' ✅', callback_data=f"user_{user}"))
+        if query.data not in context.user_data['participants']:
+            context.user_data['participants'].append(query.data)
         else:
-            markup.add(types.InlineKeyboardButton(user, callback_data=f"user_{user}"))
-    markup.add(types.InlineKeyboardButton('записати витрату', callback_data='save_expense'))
-    bot.edit_message_text(chat_id=chat_id, message_id=call.message.message_id, text='ок. на кого ця витрата?', reply_markup=markup)
+            context.user_data['participants'].remove(query.data)
+        selected_participants = ', '.join(context.user_data['participants'])
+        inline_keyboard = [
+            [InlineKeyboardButton("✔️ Антон" if "Антон" in context.user_data['participants'] else "Антон",
+                                  callback_data='Антон')],
+            [InlineKeyboardButton("✔️ Олег" if "Олег" in context.user_data['participants'] else "Олег",
+                                  callback_data='Олег')],
+            [InlineKeyboardButton("✔️ Севіль" if "Севіль" in context.user_data['participants'] else "Севіль",
+                                  callback_data='Севіль')],
+            [InlineKeyboardButton("Готово", callback_data='done')],
+        ]
+        await query.edit_message_text(
+            f"Учасники: {selected_participants}\nНатисніть 'Готово' для завершеня.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard)
+        )
+        return PARTICIPANTS
 
-# Обработчик нажатия кнопки "записати витрату"
-@bot.callback_query_handler(func=lambda call: call.data == 'save_expense')
-def save_expense(call):
-    chat_id = call.message.chat.id
-    if not expenses.get(chat_id):
-        bot.send_message(chat_id, 'спочатку додайте витрату')
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await update.message.reply_text('Добавление расхода отменено.', reply_markup=ReplyKeyboardRemove())
+    return ConversationHandler.END
+
+
+async def undo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logging.info("Команда /undo была вызвана")
+    last_expense = delete_last_expense()
+    if last_expense:
+        await update.message.reply_text(
+            f'Останню витрату скасовано: {last_expense.payer} витратив {last_expense.amount:.2f} шек. на {last_expense.description} для {last_expense.participants}.'
+        )
+    else:
+        await update.message.reply_text('Нет расходов для отмены.')
+
+
+async def history(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logging.info("Команда /history була викликана")
+    expenses = session.query(Expense).all()
+    if not expenses:
+        await update.message.reply_text('Історія витрат порожня.')
+    else:
+        history_messages = []
+        for expense in expenses:
+            history_messages.append(
+                f'{expense.payer} витратив {expense.amount:.2f} шек. на {expense.description} для {expense.participants}')
+
+        await update.message.reply_text('\n'.join(history_messages))
+
+
+def calculate_debts():
+    expenses = session.query(Expense).all()
+    balances = {}
+    for expense in expenses:
+        payer = expense.payer
+        amount = expense.amount
+        participants = [p.strip() for p in expense.participants.split(',')]
+        split_amount = amount / len(participants)
+
+        if payer not in balances:
+            balances[payer] = 0
+        balances[payer] += amount
+
+        for participant in participants:
+            if participant not in balances:
+                balances[participant] = 0
+            balances[participant] -= split_amount
+
+    net_balances = {person: balance for person, balance in balances.items() if balance != 0}
+    logging.info(f"Поточні борги: {net_balances}")
+    return net_balances
+
+async def debts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logging.info("Команда /debts була викликана")
+    debts = calculate_debts()
+    if not debts:
+        await update.message.reply_text('Нема боргів.')
+    else:
+        debt_messages = []
+        for person, amount in debts.items():
+            if amount < 0:
+                debt_messages.append(f'{person} повинен {-amount:.2f} шек.')
+            elif amount > 0:
+                debt_messages.append(f'{person} повинен отримати {amount:.2f} шек.')
+
+        await update.message.reply_text('\n'.join(debt_messages))
+
+
+async def report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logging.info("Команда /report була викликана")
+    expenses = session.query(Expense).all()
+    if not expenses:
+        await update.message.reply_text('Нема даних для звіту.')
+    else:
+        report_data = []
+        for expense in expenses:
+            report_data.append([expense.payer, expense.amount, expense.description, expense.participants])
+
+        df = pd.DataFrame(report_data, columns=['Payer', 'Amount', 'Description', 'Participants'])
+        file_path = 'expenses_report.csv'
+        df.to_csv(file_path, index=False)
+
+        await update.message.reply_document(document=open(file_path, 'rb'), filename='expenses_report.csv')
+
+
+def main():
+    init_db()
+
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not token:
+        logging.error("Токен Telegram не найден в переменных окружения")
         return
-    payer = call.from_user.first_name
-    selected_users = ', '.join(expenses[chat_id]['users'])
-    try:
-        with closing(sqlite3.connect('expenses.db')) as conn:
-            with closing(conn.cursor()) as cursor:
-                cursor.execute("INSERT INTO expenses (chat_id, amount, payer, users) VALUES (?, ?, ?, ?)",
-                               (chat_id, expenses[chat_id]['amount'], payer, selected_users))
-                conn.commit()
-        bot.send_message(chat_id, f'ок. витрату записано на: {selected_users}')
-    except sqlite3.Error as e:
-        logging.error(f'Помилка бази даных: {e}')
-        bot.send_message(chat_id, 'Виникла помилка. Спробуйте ще раз.')
 
-# Добавление команды для просмотра всех расходов
-@bot.message_handler(commands=['view_expenses'])
-def view_expenses(message):
-    try:
-        with closing(sqlite3.connect('expenses.db')) as conn:
-            with closing(conn.cursor()) as cursor:
-                cursor.execute("SELECT amount, payer, users FROM expenses WHERE chat_id=?", (message.chat.id,))
-                rows = cursor.fetchall()
-                if rows:
-                    debts = {user: 0 for user in users}
-                    for row in rows:
-                        amount, payer, user_str = row
-                        involved_users = user_str.split(', ')
-                        share = amount / len(involved_users)
-                        for user in involved_users:
-                            if user != payer:
-                                debts[user] -= share
-                                debts[payer] += share
-                    response = "Долги:\n"
-                    for user, amount in debts.items():
-                        if amount > 0:
-                            response += f"{user} повинен отримати {amount} шекелей\n"
-                        elif amount < 0:
-                            response += f"{user} повинен {abs(amount)} шекелей\n"
-                else:
-                    response = "Нема витрат."
-        bot.send_message(message.chat.id, response)
-    except sqlite3.Error as e:
-        logging.error(f'Помилка бази даных: {e}')
-        bot.send_message(message.chat.id, 'Помилка даних. Спробуйте ще раз.')
+    application = Application.builder().token(token).build()
 
-# Запускаем бота
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("debts", debts))
+    application.add_handler(CommandHandler("history", history))
+    application.add_handler(CommandHandler("undo", undo))
+    application.add_handler(CommandHandler("report", report))
+
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler('add', add_start)],
+        states={
+            PAYER: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_payer)],
+            AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_amount)],
+            DESCRIPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_description)],
+            PARTICIPANTS: [CallbackQueryHandler(add_participant)],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)],
+    )
+
+    application.add_handler(conv_handler)
+    application.run_polling()
+
+
 if __name__ == '__main__':
-    bot.polling(none_stop=True)
+    main()
