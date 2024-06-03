@@ -252,7 +252,7 @@ async def report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def main():
-    init_db()
+#    init_db() - try to fix db
 
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
